@@ -23,11 +23,8 @@ except Exception:
 import importlib
 from datetime import datetime
 import pandas as pd
-from pyspark.sql.functions import current_timestamp
 
 current_user = spark.sql("SELECT current_user()").first()[0]
-user_safe = current_user.split("@")[0].replace(".", "_").replace("-", "_")
-DATABASE_NAME = f"users.{user_safe}"
 
 # Discover project directory: find the folder containing BOTH co-located modules.
 # Handles stale sys.path entries from other sessions by prioritizing the correct dir.
@@ -53,30 +50,20 @@ from extraction import extract_all_metadata
 rows, ctx, stats = extract_all_metadata(max_workers=10, verbose=True)
 
 # --- Build DataFrame ---
-df = spark.createDataFrame(pd.DataFrame(rows)).withColumn("extracted_at", current_timestamp())
-df = df.select(*[c for c in df.columns if c != "extracted_at"] + ["extracted_at"])
+pdf = pd.DataFrame(rows)
+pdf["extracted_at"] = datetime.now().isoformat()
+df = spark.createDataFrame(pdf)
 
-# --- Write Delta ---
-output_table = f"{DATABASE_NAME}.mlflow_model_registry_metadata"
-try:
-    spark.sql(f"CREATE DATABASE IF NOT EXISTS {DATABASE_NAME}")
-except Exception:
-    pass
-df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(output_table)
-
-# --- Export CSV (relative path, written to notebook's own directory) ---
+# --- Export CSV ---
 csv_filename = f"mlflow_registry_metadata_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-df.toPandas().to_csv(csv_filename, index=False)
+pdf.to_csv(csv_filename, index=False)
 
 # --- Summary ---
-row_count = df.count()
 print(f"\n{'='*60}")
-print(f"  ✓ Delta: {output_table} — {row_count} rows, {len(df.columns)} cols")
-print(f"  ✓ CSV: ./{csv_filename}")
+print(f"  ✓ CSV: ./{csv_filename} ({len(pdf)} rows, {len(pdf.columns)} cols)")
 print(f"  ✓ User: {current_user} | Models: {stats['total_models']} | Errors: {stats['errors']}")
 print(f"{'='*60}")
 
-# /Workspace/Users/... -> /files/Users/... for browser download
 _download_url = os.path.join(project_dir, csv_filename).replace("/Workspace/", "/files/")
 displayHTML(f'<a href="{_download_url}" target="_blank">📥 Download CSV</a>')
 display(df)
