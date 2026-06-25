@@ -1,8 +1,9 @@
 """MLflow model metadata + lineage + user extraction utilities.
 
+Targets the MLflow WORKSPACE model registry (not UC).
 Extracts per-version: model identity, version details, run context,
-lineage (signatures, feature tables, datasets), user metadata
-(model owner, run executor, experiment owner), and training source.
+lineage (signatures, feature tables, datasets), user metadata,
+and training source.
 """
 
 import json
@@ -28,24 +29,6 @@ def safe_get_aliases(obj) -> list:
     if isinstance(aliases, list):
         return aliases
     return []
-
-
-def get_uc_model_metadata(w_client, model_name: str) -> dict:
-    """Get owner/creator info from Unity Catalog model API."""
-    result = {"model_owner": None, "model_created_by": None,
-              "model_updated_by": None, "model_registered_at": None}
-    if not model_name or model_name.count(".") != 2:
-        return result  # Not a UC 3-part name
-    try:
-        resp = w_client.api_client.do(
-            "GET", f"/api/2.1/unity-catalog/models/{model_name}")
-        result["model_owner"] = resp.get("owner")
-        result["model_created_by"] = resp.get("created_by")
-        result["model_updated_by"] = resp.get("updated_by")
-        result["model_registered_at"] = resp.get("created_at")
-    except Exception:
-        pass
-    return result
 
 
 def extract_lineage(client: MlflowClient, run_id: str, run=None) -> dict:
@@ -119,12 +102,10 @@ def extract_lineage(client: MlflowClient, run_id: str, run=None) -> dict:
             with open(local_path) as f:
                 fs = yaml.safe_load(f)
             tables = []
-            # input_tables is a list of {table_name: {table_id: ...}}
             for entry in fs.get("input_tables", []):
                 if isinstance(entry, dict):
                     for tname in entry:
                         tables.append({"table_name": tname, "features": [], "lookup_keys": []})
-            # Enrich from input_columns
             for entry in fs.get("input_columns", []):
                 if isinstance(entry, dict):
                     for col_name, info in entry.items():
@@ -147,13 +128,13 @@ def extract_lineage(client: MlflowClient, run_id: str, run=None) -> dict:
 
 def get_model_version_metadata(
     client: MlflowClient, model_name: str, version_obj,
-    workspace_host: str, w_client=None,
+    workspace_host: str, model_description: str = "",
     include_run_params=True, include_run_metrics=True,
 ) -> dict:
-    """Extract full metadata for a single model version."""
+    """Extract full metadata for a single model version (workspace registry)."""
     row = {
-        "model_full_name": model_name,
-        "model_short_name": model_name.split(".")[-1] if "." in model_name else model_name,
+        "model_name": model_name,
+        "model_description": model_description,
         "version_number": int(version_obj.version),
         "version_status": version_obj.status,
         "version_description": version_obj.description or "",
@@ -162,19 +143,14 @@ def get_model_version_metadata(
         "version_run_link": version_obj.run_link or "",
         "version_creation_ts": version_obj.creation_timestamp,
         "version_last_updated_ts": version_obj.last_updated_timestamp,
-        "version_aliases": json.dumps(safe_get_aliases(version_obj)),
+        "version_current_stage": getattr(version_obj, "current_stage", None),
         "version_tags": json.dumps(safe_get_tags(version_obj)),
-        "artifact_source_path": version_obj.source or "",
         # User metadata
-        "model_owner": None, "model_created_by": None,
-        "model_updated_by": None, "model_registered_at": None,
-        "run_executor_email": None, "experiment_owner_email": None,
         "mlflow_user": None, "mlflow_notebook_path": None,
+        "experiment_owner_email": None,
         "job_id": None, "job_run_id": None, "cluster_id": None,
         # Training source
         "automl_training_table": None, "automl_target_col": None,
-        # Serving/inference
-        "serving_endpoint_name": None,
         # Lineage
         "model_signature_inputs": None, "model_signature_outputs": None,
         "model_flavors": None, "feature_tables_json": None,
@@ -182,7 +158,6 @@ def get_model_version_metadata(
         "loader_module": None,
         # Run details
         "run_experiment_id": None, "run_experiment_name": None,
-        "run_experiment_artifact_location": None,
         "run_artifact_uri": None, "run_name": None,
         "run_status": None, "run_user_id": None,
         "run_start_time": None, "run_end_time": None,
@@ -193,19 +168,6 @@ def get_model_version_metadata(
         "workspace_host": workspace_host,
         "extraction_error": None,
     }
-
-    # UC model metadata (owner, created_by)
-    if w_client:
-        uc_meta = get_uc_model_metadata(w_client, model_name)
-        row.update(uc_meta)
-
-    # Version tags/aliases
-    try:
-        mv = client.get_model_version(name=model_name, version=version_obj.version)
-        row["version_tags"] = json.dumps(mv.tags or {})
-        row["version_aliases"] = json.dumps(mv.aliases or [])
-    except Exception:
-        pass
 
     # Run details
     run = None
@@ -229,7 +191,6 @@ def get_model_version_metadata(
             row["run_git_branch"] = tags.get("mlflow.source.git.branch", "")
             row["run_git_repo_url"] = tags.get("mlflow.source.git.repoURL", "")
             # User metadata from run
-            row["run_executor_email"] = tags.get("mlflow.user")
             row["mlflow_user"] = tags.get("mlflow.user")
             row["mlflow_notebook_path"] = tags.get("mlflow.databricks.notebookPath")
             row["job_id"] = tags.get("mlflow.databricks.jobID")
@@ -246,10 +207,8 @@ def get_model_version_metadata(
             try:
                 exp = client.get_experiment(run.info.experiment_id)
                 row["run_experiment_name"] = exp.name
-                row["run_experiment_artifact_location"] = exp.artifact_location
                 exp_tags = exp.tags or {}
                 row["experiment_owner_email"] = exp_tags.get("mlflow.ownerEmail")
-                # AutoML training source
                 row["automl_training_table"] = exp_tags.get("_databricks_automl.table_name")
                 row["automl_target_col"] = exp_tags.get("_databricks_automl.target_col")
             except Exception:
@@ -273,31 +232,24 @@ def process_model(
     w_client=None, endpoint_map=None,
     include_run_params=True, include_run_metrics=True,
 ) -> list:
-    """Process a registered model and all its versions."""
+    """Process a registered model and all its versions (workspace registry)."""
     model_name = model.name
+    model_desc = getattr(model, "description", "") or ""
     rows = []
     try:
         versions = client.search_model_versions(filter_string=f"name=\'{model_name}\'")
         if not versions:
-            row = {"model_full_name": model_name,
-                   "model_short_name": model_name.split(".")[-1] if "." in model_name else model_name,
-                   "version_number": 0, "version_status": "NO_VERSIONS",
-                   "workspace_host": workspace_host, "extraction_error": None}
-            if w_client:
-                row.update(get_uc_model_metadata(w_client, model_name))
-            rows.append(row)
+            rows.append({"model_name": model_name, "model_description": model_desc,
+                         "version_number": 0, "version_status": "NO_VERSIONS",
+                         "workspace_host": workspace_host, "extraction_error": None})
         else:
             for v in versions:
                 row = get_model_version_metadata(
-                    client, model_name, v, workspace_host, w_client,
+                    client, model_name, v, workspace_host, model_desc,
                     include_run_params, include_run_metrics)
-                # Add serving endpoint if mapped
-                if endpoint_map and model_name in endpoint_map:
-                    row["serving_endpoint_name"] = endpoint_map[model_name]["endpoint_name"]
                 rows.append(row)
     except Exception as e:
-        rows.append({"model_full_name": model_name,
-                     "model_short_name": model_name.split(".")[-1] if "." in model_name else model_name,
+        rows.append({"model_name": model_name, "model_description": model_desc,
                      "version_number": -1, "version_status": "ERROR",
                      "extraction_error": str(e)[:200], "workspace_host": workspace_host})
     return rows

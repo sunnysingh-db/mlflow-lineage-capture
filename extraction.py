@@ -1,7 +1,7 @@
-"""Main extraction orchestrator for MLflow model registry metadata.
+"""Main extraction orchestrator for MLflow workspace model registry metadata.
 
-Enumerates all registered models, extracts metadata in parallel,
-and maps models to serving endpoints for inference table linkage.
+Targets the WORKSPACE registry (not Unity Catalog).
+Enumerates all registered models and extracts metadata in parallel.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,50 +26,27 @@ def enumerate_all_models(client: MlflowClient):
     return models
 
 
-def get_endpoint_model_map(w_client) -> dict:
-    """Map model full names to their serving endpoint names."""
-    mapping = {}
-    try:
-        for ep in w_client.serving_endpoints.list():
-            try:
-                detail = w_client.serving_endpoints.get(ep.name)
-                if detail.config:
-                    entities = getattr(detail.config, "served_entities", None) or []
-                    for se in entities:
-                        name = getattr(se, "entity_name", None)
-                        if name:
-                            mapping[name] = {"endpoint_name": ep.name,
-                                             "creator": getattr(detail, "creator", None)}
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return mapping
-
-
 def extract_all_metadata(max_workers=10, include_run_params=True,
                          include_run_metrics=True, verbose=True):
-    client = MlflowClient()
+    # Use workspace registry (NOT UC)
+    client = MlflowClient(registry_uri="databricks")
     ctx = get_workspace_context()
     workspace_host = ctx["workspace_host"]
-    w_client = ctx["w_client"]
 
     if verbose:
         print(f"Workspace: {workspace_host}")
+        print(f"Registry: workspace (legacy MLflow)")
 
     models = enumerate_all_models(client)
     if verbose:
         print(f"Total registered models found: {len(models)}")
 
-    # Build endpoint mapping
-    endpoint_map = get_endpoint_model_map(w_client)
-
     all_rows, errors = [], 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
-                process_model, client, m, workspace_host, w_client,
-                endpoint_map, include_run_params, include_run_metrics
+                process_model, client, m, workspace_host, None,
+                None, include_run_params, include_run_metrics
             ): m.name for m in models
         }
         for i, future in enumerate(as_completed(futures), 1):
